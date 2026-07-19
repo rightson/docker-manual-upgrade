@@ -1,0 +1,8 @@
+# Generated download bundle (can be tens of GB - never commit)
+gitlab-offline-bundle/
+*.deb
+*.tar
+SHA256SUMS
+
+# Runtime state / logs created on the servers
+*.log
