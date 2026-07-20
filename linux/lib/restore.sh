@@ -39,20 +39,30 @@ gl_restore_appdata() {
 }
 
 # --- deb rollback -------------------------------------------------------------
-restore_deb() {
-  local dir="$1" bk_version="$2" app_backup="$3"
-  local deb; deb="$(EDITION=$GL_EDITION; deb_path "$bk_version")"
+# Handles both deb and rpm Omnibus rollbacks ($pm = deb|rpm).
+restore_package() {
+  local dir="$1" bk_version="$2" app_backup="$3" pm="$4"
 
   # 1. Reinstall the original version if the current binaries differ.
-  local cur; cur="$(deb_installed_version || echo unknown)"
+  local cur; cur="$(omnibus_installed_version || echo unknown)"
   if [[ "$cur" != "$bk_version" ]]; then
-    [[ -f "$deb" ]] || die "Need the original package to roll back to $bk_version but it is missing: $deb"
-    info "Reinstalling original GitLab $bk_version (current is $cur)..."
-    gitlab-ctl stop >/dev/null 2>&1 || true
-    if ! DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confdef "$deb"; then
-      warn "Plain install failed (likely a downgrade); retrying with --force-downgrade."
-      DEBIAN_FRONTEND=noninteractive dpkg -i --force-downgrade --force-confold --force-confdef "$deb" \
-        || die "Could not reinstall $bk_version."
+    if [[ "$pm" == deb ]]; then
+      local deb; deb="$(EDITION=$GL_EDITION; deb_path "$bk_version")"
+      [[ -f "$deb" ]] || die "Need the original .deb to roll back to $bk_version but it is missing: $deb"
+      info "Reinstalling original GitLab $bk_version (current is $cur)..."
+      gitlab-ctl stop >/dev/null 2>&1 || true
+      if ! DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confdef "$deb"; then
+        warn "Plain install failed (likely a downgrade); retrying with --force-downgrade."
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-downgrade --force-confold --force-confdef "$deb" \
+          || die "Could not reinstall $bk_version."
+      fi
+    else
+      local rpm_file; rpm_file="$(EDITION=$GL_EDITION; EL_VERSION=${EL_VERSION:-8}; rpm_path "$bk_version")"
+      [[ -f "$rpm_file" ]] || die "Need the original .rpm to roll back to $bk_version but it is missing: $rpm_file"
+      info "Reinstalling original GitLab $bk_version (current is $cur)..."
+      gitlab-ctl stop >/dev/null 2>&1 || true
+      # --oldpackage permits the downgrade back to the backup's version.
+      rpm -Uvh --oldpackage "$rpm_file" || die "Could not reinstall $bk_version."
     fi
   fi
 
@@ -126,11 +136,11 @@ do_rollback() {
   detect_gitlab
   GL_EDITION="$bk_edition"   # trust the backup's edition
 
-  if [[ "$bk_type" == deb ]]; then
-    restore_deb "$dir" "$bk_version" "$app_backup"
-  else
-    restore_docker "$dir" "$bk_version" "$app_backup"
-  fi
+  case "$bk_type" in
+    deb|rpm) restore_package "$dir" "$bk_version" "$app_backup" "$bk_type" ;;
+    docker)  restore_docker  "$dir" "$bk_version" "$app_backup" ;;
+    *)       die "Unknown backup type '$bk_type'." ;;
+  esac
 
   step "Rollback complete"
   ok "GitLab restored to $bk_version from backup $BACKUP_TIMESTAMP."

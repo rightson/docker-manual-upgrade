@@ -1,30 +1,62 @@
 #!/usr/bin/env bash
 # =============================================================================
 # detect.sh - discover how GitLab is installed on this host and its version.
-# Exposes: GL_TYPE (deb|docker), GL_VERSION, GL_EDITION, GL_CONTAINER (docker),
+# Exposes: GL_TYPE (deb|rpm|docker), GL_VERSION, GL_EDITION, GL_CONTAINER,
 #          and docker run-spec helpers.
 # =============================================================================
 
-# --- Omnibus (deb) ------------------------------------------------------------
-deb_installed_version() {
-  # Prefer the VERSION file (fast, exact app version); fall back to dpkg.
-  local vf pkg
-  for vf in /opt/gitlab/embedded/service/gitlab-rails/VERSION; do
-    [[ -r "$vf" ]] && { tr -d '[:space:]' <"$vf"; return 0; }
-  done
-  for pkg in gitlab-ce gitlab-ee; do
-    if dpkg-query -W -f='${Version}' "$pkg" >/dev/null 2>&1; then
-      dpkg-query -W -f='${Version}' "$pkg" | sed -E 's/-(ce|ee)\..*$//'
-      return 0
-    fi
-  done
+# --- Omnibus (deb on Debian/Ubuntu, rpm on RHEL/EL) ---------------------------
+# The Omnibus VERSION file is identical for deb and rpm installs.
+omnibus_installed_version() {
+  local vf=/opt/gitlab/embedded/service/gitlab-rails/VERSION pkg
+  [[ -r "$vf" ]] && { tr -d '[:space:]' <"$vf"; return 0; }
+  if command -v dpkg-query >/dev/null 2>&1; then
+    for pkg in gitlab-ce gitlab-ee; do
+      dpkg-query -W -f='${Version}' "$pkg" >/dev/null 2>&1 && {
+        dpkg-query -W -f='${Version}' "$pkg" | sed -E 's/-(ce|ee)\..*$//'; return 0; }
+    done
+  fi
+  if command -v rpm >/dev/null 2>&1; then
+    for pkg in gitlab-ce gitlab-ee; do
+      rpm -q "$pkg" >/dev/null 2>&1 && { rpm -q --qf '%{VERSION}' "$pkg"; return 0; }
+    done
+  fi
   return 1
 }
 
-deb_installed_edition() {
-  if dpkg-query -W gitlab-ee >/dev/null 2>&1; then echo ee
-  elif dpkg-query -W gitlab-ce >/dev/null 2>&1; then echo ce
-  else echo "${EDITION:-ce}"; fi
+# Which package manager owns the GitLab package on this host: deb | rpm
+omnibus_pkg_manager() {
+  if command -v dpkg-query >/dev/null 2>&1; then
+    for pkg in gitlab-ce gitlab-ee; do
+      dpkg-query -W "$pkg" >/dev/null 2>&1 && { echo deb; return 0; }
+    done
+  fi
+  if command -v rpm >/dev/null 2>&1; then
+    for pkg in gitlab-ce gitlab-ee; do
+      rpm -q "$pkg" >/dev/null 2>&1 && { echo rpm; return 0; }
+    done
+  fi
+  # Fall back to an OS guess when the package DB can't be queried.
+  if [[ -f /etc/redhat-release ]]; then echo rpm; else echo deb; fi
+  return 0
+}
+
+omnibus_edition() {
+  if command -v dpkg-query >/dev/null 2>&1; then
+    dpkg-query -W gitlab-ee >/dev/null 2>&1 && { echo ee; return; }
+    dpkg-query -W gitlab-ce >/dev/null 2>&1 && { echo ce; return; }
+  fi
+  if command -v rpm >/dev/null 2>&1; then
+    rpm -q gitlab-ee >/dev/null 2>&1 && { echo ee; return; }
+    rpm -q gitlab-ce >/dev/null 2>&1 && { echo ce; return; }
+  fi
+  echo "${EDITION:-ce}"
+}
+
+# The current live version, whatever the install type.
+current_version() {
+  if [[ "$GL_TYPE" == docker ]]; then docker_container_version "$GL_CONTAINER"
+  else omnibus_installed_version; fi
 }
 
 # --- Docker -------------------------------------------------------------------
@@ -97,18 +129,23 @@ docker_mount_source() {
 
 # --- top-level detection ------------------------------------------------------
 # Sets GL_TYPE, GL_VERSION, GL_EDITION, GL_CONTAINER (if docker).
-# Honours an explicit FORCE_TYPE (deb|docker|auto).
+# Honours an explicit FORCE_TYPE (deb|rpm|docker|auto).
 detect_gitlab() {
   local want="${FORCE_TYPE:-auto}"
 
-  if [[ "$want" == "deb" || "$want" == "auto" ]]; then
-    if command -v gitlab-ctl >/dev/null 2>&1 && deb_installed_version >/dev/null 2>&1; then
-      GL_TYPE=deb
-      GL_VERSION=$(deb_installed_version)
-      GL_EDITION=$(deb_installed_edition)
-      return 0
+  if [[ "$want" == "deb" || "$want" == "rpm" || "$want" == "auto" ]]; then
+    if command -v gitlab-ctl >/dev/null 2>&1 && omnibus_installed_version >/dev/null 2>&1; then
+      local pm; pm="$(omnibus_pkg_manager)"
+      if [[ "$want" == "auto" || "$want" == "$pm" ]]; then
+        GL_TYPE="$pm"
+        GL_VERSION="$(omnibus_installed_version)"
+        GL_EDITION="$(omnibus_edition)"
+        return 0
+      fi
+      die "Requested --type $want but the Omnibus GitLab here is managed by '$pm'."
     fi
-    [[ "$want" == "deb" ]] && die "Requested --type deb but no Omnibus GitLab package is installed here."
+    [[ "$want" == "deb" || "$want" == "rpm" ]] && \
+      die "Requested --type $want but no Omnibus GitLab package is installed here."
   fi
 
   if [[ "$want" == "docker" || "$want" == "auto" ]]; then

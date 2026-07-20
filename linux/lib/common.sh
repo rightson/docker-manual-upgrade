@@ -113,19 +113,34 @@ load_bundle_conf() {
   fi
   : "${EDITION:=ce}"
   : "${CODENAME:=jammy}"
+  : "${EL_VERSION:=8}"
   # Target defaults to the last stop in the path.
   if [[ -z "${TARGET_VERSION:-}" ]]; then
     for v in $UPGRADE_PATH; do TARGET_VERSION="$v"; done
   fi
-  export EDITION CODENAME UPGRADE_PATH TARGET_VERSION CURRENT_VERSION \
-         INCLUDES_DEB INCLUDES_DOCKER
+  export EDITION CODENAME EL_VERSION UPGRADE_PATH TARGET_VERSION CURRENT_VERSION \
+         INCLUDES_DEB INCLUDES_RPM INCLUDES_DOCKER
 }
 
 # ---- asset path helpers ------------------------------------------------------
+# deb (Debian/Ubuntu): underscores + _amd64.deb, laid out per codename.
 deb_filename()  { echo "gitlab-${EDITION}_${1}-${EDITION}.0_amd64.deb"; }
 deb_path()      { echo "$BUNDLE_DIR/assets/deb/${CODENAME}/$(deb_filename "$1")"; }
+# rpm (RHEL/EL): dashes + .elN.x86_64.rpm, laid out per EL major version.
+rpm_filename()  { echo "gitlab-${EDITION}-${1}-${EDITION}.0.el${EL_VERSION}.x86_64.rpm"; }
+rpm_path()      { echo "$BUNDLE_DIR/assets/rpm/el${EL_VERSION}/$(rpm_filename "$1")"; }
+# docker
 image_ref()     { echo "gitlab/gitlab-${EDITION}:${1}-${EDITION}.0"; }
 image_tar()     { echo "$BUNDLE_DIR/assets/docker/gitlab-${EDITION}-${1}-${EDITION}.0.tar"; }
+
+# Path to the on-disk asset for the ACTIVE install type.
+asset_path_for() {
+  case "$GL_TYPE" in
+    deb)    deb_path "$1" ;;
+    rpm)    rpm_path "$1" ;;
+    docker) image_tar "$1" ;;
+  esac
+}
 
 # ---- misc --------------------------------------------------------------------
 # Human readable size of a path (best effort).

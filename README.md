@@ -1,13 +1,31 @@
 # GitLab Offline Upgrade Utility (16.1 → latest)
 
 Back up, upgrade **through every required stop**, verify, and (if needed) roll
-back two production GitLab **16.1** servers that live in an **air‑gapped**
-network:
+back production GitLab **16.1** servers that live in an **air‑gapped** network.
 
-| Server | Install method | OS | Handled by |
-|--------|----------------|----|------------|
-| A | **Docker** image (`gitlab/gitlab-ce`) | Ubuntu 20.04 | `--type docker` |
-| B | **Omnibus `.deb`** package | Ubuntu 22.04 (jammy) | `--type deb` |
+## Why this exists
+
+This utility is built for running GitLab inside an **air‑gapped development
+environment for highly confidential product development** — the kind of network
+that, by policy, has **no outbound internet access** so that source code and
+build artefacts for a strictly confidential product never leave the perimeter.
+In that setting you cannot `apt`/`yum`/`docker pull` on the servers, and a
+botched upgrade can't be rescued by pulling a fixed package over the network. So
+the tool makes the whole lifecycle **deterministic and reversible offline**:
+every package/image is fetched once on a connected staging machine, transferred
+in, verified by checksum, applied through GitLab's mandatory upgrade stops, and
+— if anything goes wrong — rolled back from a backup taken moments earlier. No
+step ever reaches out to the internet from inside the enclave.
+
+## Supported servers
+
+| Install method | Operating systems | Handled by |
+|----------------|-------------------|------------|
+| **Omnibus `.deb`** package | Ubuntu 22.04 (jammy), 24.04 (noble), 20.04 (focal¹) | `--type deb` |
+| **Omnibus `.rpm`** package | RHEL / EL **8** and 9 (Rocky, Alma, CentOS Stream) | `--type rpm` |
+| **Docker** image (`gitlab/gitlab-ce`) | any Linux host | `--type docker` |
+
+¹ focal has no 19.x packages — see the OS notes below.
 
 Because the servers have no internet, you **download everything on an online
 Windows machine**, copy one self‑contained *bundle* folder to each server, and
@@ -28,7 +46,7 @@ back. No package or image is ever fetched on the servers themselves.
    ┌─────────────── ONLINE (Windows) ───────────────┐        ┌──────── OFFLINE (Ubuntu servers) ────────┐
    │  Download-GitLabAssets.ps1                      │        │  gitlab-offline-upgrade.sh                │
    │   • reads config/upgrade-path.conf              │  copy  │   preflight → backup → upgrade → verify   │
-   │   • downloads every .deb  (deb server)          │ ─────► │   (steps through each required stop,      │
+   │   • downloads .deb / .rpm packages              │ ─────► │   (steps through each required stop,      │
    │   • docker pull + save   (docker server)        │ bundle │    waiting for DB + background migrations │
    │   • copies the Linux scripts + checksums        │        │    between each one)                      │
    │   → produces  gitlab-offline-bundle/            │        │   rollback  (restore from backup)         │
@@ -105,6 +123,12 @@ Useful variants:
 # Only the deb server's packages (Ubuntu 22.04 / jammy):
 .\Download-GitLabAssets.ps1 -Deb -Codename jammy -CurrentVersion 16.1.8
 
+# Ubuntu 24.04 (noble) — noble packages exist from 17.1 onward:
+.\Download-GitLabAssets.ps1 -Deb -Codename noble -CurrentVersion 17.3.7
+
+# RHEL / EL 8 server (.rpm):
+.\Download-GitLabAssets.ps1 -Rpm -ElVersion 8 -CurrentVersion 16.1.8
+
 # Only the docker server's images:
 .\Download-GitLabAssets.ps1 -Docker -CurrentVersion 16.1.6
 
@@ -115,10 +139,15 @@ Useful variants:
 This produces `gitlab-offline-bundle/` containing `assets/`, the Linux scripts,
 `bundle.conf`, and `SHA256SUMS`.
 
-> **Ubuntu 20.04 (focal) note:** GitLab publishes **no 19.x `.deb` packages for
-> focal** (only up to 18.8.x). Your **deb** server is 22.04 (jammy), so this
-> is fine. The **docker** server being on 20.04 does not matter — Docker images
-> are independent of the host OS.
+> **OS availability (validated 2026‑07):**
+> - **Ubuntu 22.04 (jammy)** — all stops available.
+> - **Ubuntu 24.04 (noble)** — packages start at **17.1.x** (24.04 postdates
+>   16.x). A noble server is therefore already on ≥ 17.1; `-Validate` flags gaps.
+> - **Ubuntu 20.04 (focal)** — `.deb` only up to **18.8.x**; there are **no 19.x
+>   focal packages**, so a focal server needs an OS upgrade to jammy to go past
+>   18.8.
+> - **RHEL / EL 8** — all stops available as `.rpm`.
+> - **Docker** — host OS is irrelevant (image is self‑contained).
 
 ---
 
@@ -136,7 +165,7 @@ to **both** servers.
 cd gitlab-offline-bundle
 chmod +x gitlab-offline-upgrade.sh
 
-# See what will happen (detects deb vs docker automatically):
+# See what will happen (detects deb / rpm / docker automatically):
 sudo ./gitlab-offline-upgrade.sh status
 
 # Verify checksums, disk, and that every needed asset is present:
@@ -225,8 +254,9 @@ sudo ./gitlab-offline-upgrade.sh verify   # prints version, runs gitlab:check
 
 | Option | Meaning |
 |--------|---------|
-| `--type deb\|docker\|auto` | Force install type (default: auto‑detect). |
+| `--type deb\|rpm\|docker\|auto` | Force install type (default: auto‑detect). |
 | `--edition ce\|ee` | GitLab edition. |
+| `--el-version N` | RHEL/EL major version for rpm (default: 8). |
 | `--container NAME` | Docker container name (default: auto‑detect). |
 | `--to VERSION` | Stop upgrading once VERSION is reached. |
 | `--step` | Apply only the next single stop, then exit. |
@@ -244,7 +274,7 @@ sudo ./gitlab-offline-upgrade.sh verify   # prints version, runs gitlab:check
   before touching production.
 - **Downtime.** Each stop restarts GitLab and runs migrations; expect the
   instance to be unavailable during the run.
-- **Disk.** Ensure ≥20 GB free on `/var/opt/gitlab` (deb) or `/var/lib/docker`
+- **Disk.** Ensure ≥20 GB free on `/var/opt/gitlab` (deb/rpm) or `/var/lib/docker`
   (docker) for backups and migrations. `preflight` checks this.
 - **Secrets are non‑negotiable.** Without `gitlab-secrets.json`, a restored
   backup cannot decrypt 2FA, CI/CD variables or tokens. Keep the backup folder

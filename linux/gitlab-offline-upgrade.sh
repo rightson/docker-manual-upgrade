@@ -4,8 +4,9 @@
 #
 # One script to back up, upgrade (through every required stop), verify and
 # roll back an OFFLINE GitLab server - whether it runs from the Omnibus .deb
-# package or from a Docker image. Uses only assets already downloaded into the
-# bundle by the Windows-side downloader (no internet access required here).
+# package (Debian/Ubuntu), the Omnibus .rpm package (RHEL/EL), or a Docker
+# image. Uses only assets already downloaded into the bundle by the Windows-side
+# downloader (no internet access required here).
 #
 # Usage:
 #   sudo ./gitlab-offline-upgrade.sh <command> [options]
@@ -19,8 +20,9 @@
 #   verify            Post-upgrade health checks.
 #
 # Common options:
-#   --type deb|docker|auto   Force the install type (default: auto-detect).
+#   --type deb|rpm|docker|auto  Force the install type (default: auto-detect).
 #   --edition ce|ee          GitLab edition (default: auto/ce).
+#   --el-version N           RHEL/EL major version for rpm (default: 8).
 #   --container NAME         Docker container name (default: auto-detect).
 #   --to VERSION             Stop upgrading once VERSION is reached.
 #   --step                   Apply only the next single required stop, then stop.
@@ -45,9 +47,10 @@ SKIP_BACKUP=0
 BUNDLE_DIR="$SCRIPT_DIR"
 WORK_DIR="/var/opt/gitlab-offline-upgrade"
 ROLLBACK_BACKUP=""
+EL_OVERRIDE=""
 export FORCE_TYPE GL_EDITION GL_CONTAINER ASSUME_YES
 
-usage() { sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,/^# =====/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---- parse args --------------------------------------------------------------
 [[ $# -ge 1 ]] || { usage; exit 1; }
@@ -56,6 +59,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --type)      FORCE_TYPE="$2"; shift 2;;
     --edition)   GL_EDITION="$2"; EDITION="$2"; shift 2;;
+    --el-version) EL_OVERRIDE="$2"; shift 2;;
     --container) GL_CONTAINER="$2"; shift 2;;
     --to)        TARGET_OVERRIDE="$2"; shift 2;;
     --step)      STEP_ONLY=1; shift;;
@@ -76,7 +80,7 @@ LOG_FILE="$WORK_DIR/logs/${COMMAND}-$(date '+%Y%m%d-%H%M%S').log"
 export LOG_FILE
 
 # ---- load libraries ----------------------------------------------------------
-for lib in common detect backup restore upgrade_deb upgrade_docker; do
+for lib in common detect backup restore upgrade_deb upgrade_rpm upgrade_docker; do
   f="$SCRIPT_DIR/lib/$lib.sh"
   [[ -f "$f" ]] || { echo "Missing library: $f" >&2; exit 1; }
   # shellcheck disable=SC1090
@@ -89,6 +93,7 @@ fi
 
 load_bundle_conf
 [[ -n "$GL_EDITION" ]] && EDITION="$GL_EDITION"
+[[ -n "$EL_OVERRIDE" ]] && EL_VERSION="$EL_OVERRIDE"
 
 # ---- helpers -----------------------------------------------------------------
 resolved_target() {
@@ -97,9 +102,7 @@ resolved_target() {
 
 # asset for a version exists for the active install type?
 asset_present() {
-  local v="$1"
-  if [[ "$GL_TYPE" == docker ]]; then [[ -f "$(image_tar "$v")" ]]
-  else [[ -f "$(deb_path "$v")" ]]; fi
+  [[ -f "$(asset_path_for "$1")" ]]
 }
 
 print_plan() {
@@ -108,7 +111,11 @@ print_plan() {
   step "Upgrade plan"
   info "Current version : $GL_VERSION"
   info "Target version  : $target"
-  info "Edition         : $EDITION   Codename(deb): $CODENAME"
+  case "$GL_TYPE" in
+    deb)    info "Edition         : $EDITION   Type: deb (Ubuntu/${CODENAME})" ;;
+    rpm)    info "Edition         : $EDITION   Type: rpm (RHEL/EL${EL_VERSION})" ;;
+    docker) info "Edition         : $EDITION   Type: docker image" ;;
+  esac
   if [[ -z "$pending" ]]; then
     ok "Already at or beyond the target; nothing to do."
     return 0
@@ -187,9 +194,13 @@ cmd_upgrade() {
   while read -r v; do
     [[ -z "$v" ]] && continue
     confirm "Apply upgrade stop -> $v ?" || { warn "Stopped by user before $v."; break; }
-    if [[ "$GL_TYPE" == deb ]]; then deb_apply_stop "$v"; else docker_apply_stop "$v"; fi
+    case "$GL_TYPE" in
+      deb)    deb_apply_stop "$v" ;;
+      rpm)    rpm_apply_stop "$v" ;;
+      docker) docker_apply_stop "$v" ;;
+    esac
     # refresh detected version from the live instance
-    GL_VERSION="$([[ "$GL_TYPE" == deb ]] && deb_installed_version || docker_container_version "$GL_CONTAINER")"
+    GL_VERSION="$(current_version)"
     echo "$GL_VERSION" >"$WORK_DIR/.current_version"
     if [[ "$STEP_ONLY" == 1 ]]; then
       ok "Applied one stop (--step); current version now $GL_VERSION. Re-run to continue."
@@ -209,7 +220,7 @@ cmd_rollback() {
 cmd_verify() {
   detect_gitlab
   step "Post-upgrade verification"
-  info "Version: $([[ "$GL_TYPE" == deb ]] && deb_installed_version || docker_container_version "$GL_CONTAINER")"
+  info "Version: $(current_version)"
   gl_wait_ready 600 || warn "Instance not ready yet."
   info "Running gitlab-rake gitlab:check (SANITIZE=true)..."
   gl_exec gitlab-rake gitlab:check SANITIZE=true || warn "gitlab:check reported issues; review above."

@@ -2,23 +2,26 @@
 .SYNOPSIS
   Download every GitLab package / Docker image needed for an OFFLINE upgrade
   from 16.1 to the latest release, and assemble a self-contained "bundle"
-  folder you copy to each air-gapped Ubuntu server.
+  folder you copy to each air-gapped server.
 
 .DESCRIPTION
   Runs on an ONLINE Windows machine. Reads the required upgrade "stops" from
   config\upgrade-path.conf and, for each one, downloads:
-    * the Omnibus .deb package (for the deb-installed server), and/or
-    * the Docker image, saved as a .tar (for the Docker server).
+    * the Omnibus .deb package  - Debian/Ubuntu servers (jammy/focal/noble), and/or
+    * the Omnibus .rpm package  - RHEL / EL servers (el8, el9), and/or
+    * the Docker image, saved as a .tar - Docker servers.
   It also copies the Linux-side scripts and writes a manifest (bundle.conf) plus
   SHA256SUMS so the server can verify integrity after transfer.
 
 .PARAMETER Edition       ce (default) or ee.
-.PARAMETER Codename      Ubuntu codename for the .deb server: jammy (22.04, default) or focal (20.04).
+.PARAMETER Codename      Ubuntu codename for the .deb server: jammy (22.04, default), focal (20.04), noble (24.04).
+.PARAMETER ElVersion     RHEL/EL major version for the .rpm server: 8 (default) or 9.
 .PARAMETER CurrentVersion  Exact running version(s), e.g. 16.1.8. Included so ROLLBACK is possible. Repeatable.
 .PARAMETER TargetVersion   Stop after this version (default: last entry in the path file).
 .PARAMETER FromVersion     Only download stops greater than this (default: download the whole path).
 .PARAMETER OutDir        Bundle output directory (default: ..\gitlab-offline-bundle).
-.PARAMETER Deb           Download .deb packages. If neither -Deb nor -Docker is given, BOTH are done.
+.PARAMETER Deb           Download .deb packages. If none of -Deb/-Rpm/-Docker is given, -Deb + -Docker are done.
+.PARAMETER Rpm           Download .rpm packages (RHEL/EL).
 .PARAMETER Docker        Download + save Docker images (requires Docker Desktop running).
 .PARAMETER Validate      Do NOT download; only HEAD/manifest-check that every asset exists. Run this FIRST.
 .PARAMETER SkipScripts   Do not copy the Linux scripts into the bundle.
@@ -32,19 +35,25 @@
   .\Download-GitLabAssets.ps1 -Codename jammy -CurrentVersion 16.1.8
 
 .EXAMPLE
-  # Only the docker server's images:
-  .\Download-GitLabAssets.ps1 -Docker -CurrentVersion 16.1.6
+  # RHEL 8 server:
+  .\Download-GitLabAssets.ps1 -Rpm -ElVersion 8 -CurrentVersion 16.1.8
+
+.EXAMPLE
+  # Ubuntu 24.04 server (noble): note noble packages exist from 17.1 onward.
+  .\Download-GitLabAssets.ps1 -Deb -Codename noble -CurrentVersion 17.3.7
 #>
 [CmdletBinding()]
 param(
   [string]$Config = "$PSScriptRoot\..\config\upgrade-path.conf",
   [ValidateSet('ce','ee')][string]$Edition = 'ce',
-  [ValidateSet('jammy','focal')][string]$Codename = 'jammy',
+  [ValidateSet('jammy','focal','noble')][string]$Codename = 'jammy',
+  [ValidateSet('8','9')][string]$ElVersion = '8',
   [string[]]$CurrentVersion = @(),
   [string]$TargetVersion = '',
   [string]$FromVersion = '',
   [string]$OutDir = "$PSScriptRoot\..\gitlab-offline-bundle",
   [switch]$Deb,
+  [switch]$Rpm,
   [switch]$Docker,
   [switch]$Validate,
   [switch]$SkipScripts
@@ -53,7 +62,7 @@ param(
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-if (-not $Deb -and -not $Docker) { $Deb = $true; $Docker = $true }
+if (-not $Deb -and -not $Rpm -and -not $Docker) { $Deb = $true; $Docker = $true }
 
 function Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)  { Write-Host "[+] $m" -ForegroundColor Green }
@@ -83,11 +92,12 @@ $downloadSet += $plan
 $downloadSet = $downloadSet | Where-Object { $_ } | Select-Object -Unique
 
 Info "Edition        : $Edition"
-Info "Deb codename   : $Codename"
+if ($Deb) { Info "Deb codename   : $Codename" }
+if ($Rpm) { Info "RPM platform   : el$ElVersion" }
 Info "Target version : $TargetVersion"
 Info "Path stops     : $($plan -join ', ')"
 if ($CurrentVersion) { Info "Rollback base  : $($CurrentVersion -join ', ')" }
-$assetKinds = @(); if ($Deb) { $assetKinds += 'deb' }; if ($Docker) { $assetKinds += 'docker' }
+$assetKinds = @(); if ($Deb) { $assetKinds += 'deb' }; if ($Rpm) { $assetKinds += 'rpm' }; if ($Docker) { $assetKinds += 'docker' }
 Info "Assets         : $($assetKinds -join ' + ')"
 Info "Bundle dir     : $OutDir"
 Write-Host ""
@@ -99,9 +109,11 @@ if (-not $Validate) {
   $OutDir = (Resolve-Path $OutDir).Path
 }
 $debDir    = Join-Path $OutDir "assets\deb\$Codename"
+$rpmDir    = Join-Path $OutDir "assets\rpm\el$ElVersion"
 $dockerDir = Join-Path $OutDir "assets\docker"
 if (-not $Validate) {
   if ($Deb)    { New-Item -ItemType Directory -Force -Path $debDir    | Out-Null }
+  if ($Rpm)    { New-Item -ItemType Directory -Force -Path $rpmDir    | Out-Null }
   if ($Docker) { New-Item -ItemType Directory -Force -Path $dockerDir | Out-Null }
 }
 
@@ -109,6 +121,11 @@ if (-not $Validate) {
 function Deb-Url($ver){
   $file = "gitlab-${Edition}_${ver}-${Edition}.0_amd64.deb"
   $url  = "https://packages.gitlab.com/gitlab/gitlab-${Edition}/packages/ubuntu/${Codename}/${file}/download.deb"
+  return @{ File = $file; Url = $url }
+}
+function Rpm-Url($ver){
+  $file = "gitlab-${Edition}-${ver}-${Edition}.0.el${ElVersion}.x86_64.rpm"
+  $url  = "https://packages.gitlab.com/gitlab/gitlab-${Edition}/packages/el/${ElVersion}/${file}/download.rpm"
   return @{ File = $file; Url = $url }
 }
 function Image-Ref($ver){ "gitlab/gitlab-${Edition}:${ver}-${Edition}.0" }
@@ -148,6 +165,39 @@ function Get-Deb($ver){
     }
   }
 }
+function Test-Rpm($ver){
+  $d = Rpm-Url $ver
+  try {
+    $r = Invoke-WebRequest -Uri $d.Url -Method Head -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 60
+    if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 400) { return $true }
+  } catch {}
+  try {
+    $r = Invoke-WebRequest -Uri $d.Url -Method Get -Headers @{ Range = 'bytes=0-0' } `
+           -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 60
+    return ($r.StatusCode -ge 200 -and $r.StatusCode -lt 400)
+  } catch { return $false }
+}
+function Get-Rpm($ver){
+  $d = Rpm-Url $ver
+  $out = Join-Path $rpmDir $d.File
+  if ((Test-Path $out) -and (Get-Item $out).Length -gt 1MB) { Ok "rpm $ver already downloaded"; return }
+  Info "Downloading rpm $ver ..."
+  $attempt = 0
+  while ($true) {
+    $attempt++
+    try {
+      Invoke-WebRequest -Uri $d.Url -OutFile $out -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 1800
+      if ((Get-Item $out).Length -lt 1MB) { throw "downloaded file suspiciously small" }
+      Ok ("rpm {0} -> {1} ({2:N0} MB)" -f $ver, $d.File, ((Get-Item $out).Length/1MB))
+      break
+    } catch {
+      if ($attempt -ge 4) { Fail "Failed to download rpm $ver after $attempt attempts: $_" }
+      $wait = [math]::Pow(2,$attempt)
+      Warn "rpm $ver download failed (attempt $attempt): $_. Retrying in ${wait}s..."
+      Start-Sleep -Seconds $wait
+    }
+  }
+}
 function Test-Image($ver){
   $ref = Image-Ref $ver
   & docker manifest inspect $ref *> $null
@@ -172,7 +222,10 @@ if ($Validate) {
   $bad = 0
   foreach ($v in $downloadSet) {
     if ($Deb) {
-      if (Test-Deb $v) { Ok "deb    $v  OK" } else { Warn "deb    $v  MISSING (check the version/patch number)"; $bad++ }
+      if (Test-Deb $v) { Ok "deb    $v  OK" } else { Warn "deb    $v  MISSING ($Codename - noble packages exist from 17.1+)"; $bad++ }
+    }
+    if ($Rpm) {
+      if (Test-Rpm $v) { Ok "rpm    $v  OK" } else { Warn "rpm    $v  MISSING (el$ElVersion - check the version/patch number)"; $bad++ }
     }
     if ($Docker) {
       if (Test-Image $v) { Ok "image  $v  OK" } else { Warn "image  $v  MISSING (check the version/patch number, and that Docker is running)"; $bad++ }
@@ -187,6 +240,7 @@ if ($Validate) {
 # ---- download ----------------------------------------------------------------
 foreach ($v in $downloadSet) {
   if ($Deb)    { Get-Deb   $v }
+  if ($Rpm)    { Get-Rpm   $v }
   if ($Docker) { Save-Image $v }
 }
 
@@ -216,10 +270,12 @@ $bundleConf = @(
   "# Generated by Download-GitLabAssets.ps1 on $(Get-Date -Format s)"
   "EDITION=$Edition"
   "CODENAME=$Codename"
+  "EL_VERSION=$ElVersion"
   "CURRENT_VERSION=$curStr"
   "TARGET_VERSION=$TargetVersion"
   "UPGRADE_PATH=`"$pathStr`""
   "INCLUDES_DEB=$([int][bool]$Deb)"
+  "INCLUDES_RPM=$([int][bool]$Rpm)"
   "INCLUDES_DOCKER=$([int][bool]$Docker)"
 ) -join "`n"
 [IO.File]::WriteAllText((Join-Path $OutDir 'bundle.conf'), $bundleConf + "`n")
