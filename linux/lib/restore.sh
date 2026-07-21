@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# restore.sh - roll back to a pre-upgrade backup.
+# restore.sh - two related but distinct operations:
 #
-# GitLab does NOT support downgrading in place: once migrations run the schema
-# is newer than the old binaries. The only reliable rollback is:
-#   1. Put the ORIGINAL binaries/image back (same version the backup came from).
-#   2. Restore the ORIGINAL secrets/config.
-#   3. Restore the application-data backup with `gitlab-backup restore`.
+#   * rollback (do_rollback) - UNDO an in-place upgrade on the SAME host. It
+#     reinstalls the ORIGINAL version's binaries/image from the bundle, then
+#     restores that host's own pre-upgrade backup. GitLab cannot downgrade in
+#     place, so this is the only supported way to revert an upgrade.
+#
+#   * restore  (do_restore)  - IMPORT a single portable backup file (produced by
+#     the `backup` command) into the GitLab that is ALREADY installed on THIS
+#     host - which may be a DIFFERENT, freshly-installed machine. This is the
+#     backup/migrate-to-another-server flow. GitLab requires the target to run
+#     the SAME version as the backup, so install that version first, then run
+#     `restore --from <file>`.
+#
+# Both ultimately call `gitlab-backup restore` after putting the original
+# secrets/config in place so encrypted data (2FA, tokens, CI/CD vars) decrypts.
 # =============================================================================
 
 # Resolve which backup directory to use. Honours $ROLLBACK_BACKUP (--backup).
@@ -145,4 +154,139 @@ do_rollback() {
   step "Rollback complete"
   ok "GitLab restored to $bk_version from backup $BACKUP_TIMESTAMP."
   info "Log in and verify projects, users and CI/CD variables before resuming use."
+}
+
+# =============================================================================
+# restore (migration): import a portable backup file into THIS host's GitLab.
+# =============================================================================
+
+# Resolve the restore source to an unpacked backup DIRECTORY. Accepts:
+#   --from <archive.tar.gz>  (RESTORE_FROM)  - a single portable backup file
+#   --backup <dir|archive>   (ROLLBACK_BACKUP)
+#   (nothing)                                - the last portable backup made here
+# Prints the directory path on stdout.
+resolve_restore_source() {
+  local root="$1" src=""
+  src="${RESTORE_FROM:-}"
+  [[ -z "$src" && -n "${ROLLBACK_BACKUP:-}" ]] && src="$ROLLBACK_BACKUP"
+  if [[ -z "$src" && -f "$root/.last_portable_backup" ]]; then
+    src="$(cat "$root/.last_portable_backup")"
+  fi
+  [[ -n "$src" ]] || die "Nothing to restore. Pass --from <backup-file.tar.gz> (or --backup <dir>)."
+
+  # A directory is used as-is.
+  if [[ -d "$src" ]]; then echo "$src"; return 0; fi
+  [[ -f "$src" ]] || die "Restore source not found: $src"
+
+  # A file: unpack the portable archive to a temp dir under the work dir.
+  local tmp="$root/.restore-extract/$BACKUP_TS"
+  mkdir -p "$tmp"
+  info "Extracting portable backup: $src"
+  tar -C "$tmp" -xzf "$src" || die "Failed to extract $src (is it a gitlab-offline-upgrade backup file?)."
+  local inner
+  inner="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)"
+  [[ -n "$inner" && -f "$inner/metadata.env" ]] \
+    || die "Archive '$src' does not contain a valid backup (no metadata.env inside)."
+  echo "$inner"
+}
+
+# Put the app-data tar from the backup dir into THIS host's backups directory,
+# owned by git, so gitlab-backup restore can find it.
+place_app_tar() {
+  local dir="$1" app_backup="$2"
+  local fname="${app_backup}_gitlab_backup.tar"
+  [[ -f "$dir/$fname" ]] || die \
+"This backup has no app-data tar ($fname) inside it. It was taken in 'light'
+ (pre-upgrade) mode and can only be used for an in-place rollback, not a
+ restore to another host. Re-create it with the 'backup' command."
+  step "Placing the application-data tar into this host's backups directory"
+  if [[ "$GL_TYPE" == docker ]]; then
+    docker exec "$GL_CONTAINER" mkdir -p /var/opt/gitlab/backups
+    docker cp "$dir/$fname" "$GL_CONTAINER:/var/opt/gitlab/backups/$fname" \
+      || die "docker cp of the app-data tar into the container failed."
+    docker exec "$GL_CONTAINER" chown git:git "/var/opt/gitlab/backups/$fname" \
+      || warn "Could not chown the tar to git:git (continuing)."
+  else
+    mkdir -p /var/opt/gitlab/backups
+    cp -a "$dir/$fname" "/var/opt/gitlab/backups/$fname" \
+      || die "Copying the app-data tar into /var/opt/gitlab/backups failed."
+    chown git:git "/var/opt/gitlab/backups/$fname" 2>/dev/null \
+      || warn "Could not chown the tar to git:git (continuing)."
+  fi
+  ok "Placed $fname"
+}
+
+# Restore secrets + config into the CURRENT install, then reconfigure.
+restore_secrets_config() {
+  local dir="$1"
+  step "Restoring gitlab-secrets.json and gitlab.rb"
+  if [[ "$GL_TYPE" == docker ]]; then
+    [[ -f "$dir/gitlab-secrets.json" ]] && docker cp "$dir/gitlab-secrets.json" "$GL_CONTAINER:/etc/gitlab/gitlab-secrets.json"
+    [[ -f "$dir/gitlab.rb"           ]] && docker cp "$dir/gitlab.rb"           "$GL_CONTAINER:/etc/gitlab/gitlab.rb"
+    gl_exec gitlab-ctl reconfigure || die "reconfigure failed after restoring secrets."
+  else
+    [[ -f "$dir/gitlab-secrets.json" ]] && cp -a "$dir/gitlab-secrets.json" /etc/gitlab/gitlab-secrets.json
+    [[ -f "$dir/gitlab.rb"           ]] && cp -a "$dir/gitlab.rb"           /etc/gitlab/gitlab.rb
+    gitlab-ctl reconfigure || die "reconfigure failed after restoring secrets."
+  fi
+  gl_wait_ready 1800 || die "GitLab did not come up after restoring secrets/config."
+}
+
+# --- entry point --------------------------------------------------------------
+# Import a portable backup into whatever GitLab is installed on THIS host.
+do_restore() {
+  local root="$1"
+  require_root
+  BACKUP_TS="$(date '+%Y%m%d-%H%M%S')"   # used to name the temp extraction dir
+  local dir; dir="$(resolve_restore_source "$root")"
+  [[ -f "$dir/metadata.env" ]] || die "No metadata.env in $dir; not a valid backup."
+  # shellcheck disable=SC1090
+  # Keep the operator's explicit --container (if any) BEFORE metadata.env
+  # clobbers GL_CONTAINER with the SOURCE host's container name.
+  local user_container="${GL_CONTAINER:-}"
+  # shellcheck disable=SC1090
+  source "$dir/metadata.env"
+  local bk_type="$GL_TYPE" bk_edition="$GL_EDITION" bk_version="$GL_VERSION" app_backup="$APP_BACKUP"
+
+  step "RESTORE a portable backup onto this host"
+  info "Backup source : $dir"
+  info "Backup is     : $bk_type/$bk_edition   GitLab $bk_version   (from ${HOSTNAME:-unknown}, $BACKUP_TIMESTAMP)"
+
+  # The target GitLab must ALREADY be installed here (possibly a fresh machine).
+  # Reset GL_CONTAINER to the operator's override (or empty) so detection finds
+  # THIS host's container instead of the source host's name from metadata.
+  GL_CONTAINER="$user_container"
+  detect_gitlab
+  print_detection
+  local cur="$GL_VERSION"
+
+  # Install-type sanity.
+  if [[ "$GL_TYPE" != "$bk_type" ]]; then
+    warn "This host is a '$GL_TYPE' install but the backup came from '$bk_type'."
+    warn "Restoring across install types works only if the GitLab VERSION matches exactly."
+  fi
+  # GitLab only restores a backup into the SAME version.
+  if [[ "$cur" != "$bk_version" ]]; then
+    warn "Installed GitLab is $cur but this backup is from $bk_version."
+    warn "GitLab can ONLY restore a backup into an install running the SAME version."
+    warn "Install GitLab $bk_version on this host first, then re-run:"
+    warn "    sudo ./gitlab-offline-upgrade.sh restore --from <backup-file.tar.gz>"
+    confirm "Continue anyway (NOT recommended - restore will likely fail)?" || die "Aborted."
+  fi
+
+  warn "This will OVERWRITE the database, repositories and uploads on THIS host"
+  warn "with the data from the backup. Any existing data here is lost."
+  confirm "Proceed with the restore?" || die "Restore aborted."
+
+  place_app_tar "$dir" "$app_backup"
+  restore_secrets_config "$dir"
+  gl_restore_appdata "$app_backup"
+
+  info "Running integrity checks..."
+  gl_exec gitlab-rake gitlab:check SANITIZE=true || warn "gitlab:check reported issues (review above)."
+  gl_exec gitlab-rake gitlab:doctor:secrets      || warn "doctor:secrets reported issues (review above)."
+
+  step "Restore complete"
+  ok "Restored GitLab $bk_version data onto this host."
+  info "Log in and verify projects, users, and CI/CD variables before going live."
 }

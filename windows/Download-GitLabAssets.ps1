@@ -25,6 +25,12 @@
 .PARAMETER Docker        Download + save Docker images (requires Docker Desktop running).
 .PARAMETER Validate      Do NOT download; only HEAD/manifest-check that every asset exists. Run this FIRST.
 .PARAMETER SkipScripts   Do not copy the Linux scripts into the bundle.
+.PARAMETER SftpHost      SFTP server (the offline GitLab host or a jump box). When set, the finished bundle is uploaded there.
+.PARAMETER SftpPort      SFTP port (default 22).
+.PARAMETER SftpUser      SFTP username. Required when -SftpHost is set.
+.PARAMETER SftpRemotePath  Directory ON THE SERVER to upload the bundle INTO. This is the "remote path" you later pass to the Linux script's --bundle/--path.
+.PARAMETER SftpKey       Optional path to a private key file for key-based auth. If omitted, sftp prompts for a password.
+.PARAMETER UploadOnly    Skip downloading; just upload an already-built -OutDir bundle over SFTP.
 
 .EXAMPLE
   # 1) Confirm every version in the path really exists before a big download:
@@ -41,6 +47,17 @@
 .EXAMPLE
   # Ubuntu 24.04 server (noble): note noble packages exist from 17.1 onward.
   .\Download-GitLabAssets.ps1 -Deb -Codename noble -CurrentVersion 17.3.7
+
+.EXAMPLE
+  # ONE command: download everything for a 16.1.8 deb server AND push the bundle
+  # to the offline host over SFTP into /srv/gitlab-bundle:
+  .\Download-GitLabAssets.ps1 -CurrentVersion 16.1.8 -Codename jammy `
+      -SftpHost 10.0.0.5 -SftpPort 22 -SftpUser deploy -SftpRemotePath /srv/gitlab-bundle
+
+.EXAMPLE
+  # Upload an already-downloaded bundle (no re-download):
+  .\Download-GitLabAssets.ps1 -UploadOnly `
+      -SftpHost 10.0.0.5 -SftpUser deploy -SftpRemotePath /srv/gitlab-bundle
 #>
 [CmdletBinding()]
 param(
@@ -56,7 +73,13 @@ param(
   [switch]$Rpm,
   [switch]$Docker,
   [switch]$Validate,
-  [switch]$SkipScripts
+  [switch]$SkipScripts,
+  [string]$SftpHost = '',
+  [int]$SftpPort = 22,
+  [string]$SftpUser = '',
+  [string]$SftpRemotePath = '',
+  [string]$SftpKey = '',
+  [switch]$UploadOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +91,77 @@ function Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)  { Write-Host "[+] $m" -ForegroundColor Green }
 function Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
 function Fail($m){ Write-Host "[x] $m" -ForegroundColor Red; exit 1 }
+
+# ---- SFTP upload -------------------------------------------------------------
+# Uploads the whole bundle folder to the server over SFTP, INTO $RemotePath, so
+# the server ends up with <RemotePath>/<bundle-folder-name>/... That directory
+# is the "remote path" you hand to the Linux script (--bundle / --path).
+function Send-BundleOverSftp {
+  param(
+    [string]$LocalDir, [string]$SftpHost, [int]$Port,
+    [string]$User, [string]$RemotePath, [string]$KeyFile
+  )
+  $sftp = (Get-Command sftp -ErrorAction SilentlyContinue)
+  if (-not $sftp) {
+    Fail ("sftp.exe not found. Install the built-in 'OpenSSH Client' " +
+          "(Settings > Apps > Optional Features), or copy the '$LocalDir' " +
+          "folder to the server manually.")
+  }
+  if (-not (Test-Path $LocalDir)) { Fail "Bundle folder to upload not found: $LocalDir" }
+  $LocalDir = (Resolve-Path $LocalDir).Path
+  $leaf = Split-Path $LocalDir -Leaf
+
+  # sftp batch: '-mkdir' ignores 'already exists'; then cd + recursive put.
+  $batch = @(
+    "-mkdir `"$RemotePath`""
+    "cd `"$RemotePath`""
+    "put -r `"$LocalDir`""
+    "bye"
+  ) -join "`n"
+  $batchFile = Join-Path $env:TEMP ("gitlab-sftp-" + [IO.Path]::GetRandomFileName() + ".txt")
+  [IO.File]::WriteAllText($batchFile, $batch + "`n")
+
+  $sshOpts = @('-o','StrictHostKeyChecking=accept-new','-P',"$Port")
+  if ($KeyFile) {
+    if (-not (Test-Path $KeyFile)) { Fail "SFTP key file not found: $KeyFile" }
+    $sshOpts += @('-i', $KeyFile)
+  }
+  $target = "${User}@${SftpHost}"
+
+  Info "Uploading bundle over SFTP to ${target}:$RemotePath ..."
+  Info "  (remote path becomes: $RemotePath/$leaf)"
+  $attempt = 0
+  while ($true) {
+    $attempt++
+    & $sftp.Source @sshOpts '-b' $batchFile $target
+    if ($LASTEXITCODE -eq 0) { break }
+    if ($attempt -ge 4) {
+      Remove-Item $batchFile -ErrorAction SilentlyContinue
+      Fail "SFTP upload failed after $attempt attempts (exit $LASTEXITCODE)."
+    }
+    $wait = [math]::Pow(2,$attempt)
+    Warn "SFTP upload failed (attempt $attempt). Retrying in ${wait}s..."
+    Start-Sleep -Seconds $wait
+  }
+  Remove-Item $batchFile -ErrorAction SilentlyContinue
+  Ok "Bundle uploaded. On the server it is at: $RemotePath/$leaf"
+  Info "On the offline server run, from inside that folder:"
+  Info "    cd $RemotePath/$leaf"
+  Info "    sudo ./gitlab-offline-upgrade.sh upgrade --path $RemotePath/$leaf"
+}
+
+# ---- SFTP parameter validation + upload-only shortcut ------------------------
+$DoSftp = [bool]$SftpHost
+if ($DoSftp) {
+  if (-not $SftpUser)       { Fail "-SftpUser is required when -SftpHost is set." }
+  if (-not $SftpRemotePath) { Fail "-SftpRemotePath is required when -SftpHost is set." }
+}
+if ($UploadOnly) {
+  if (-not $DoSftp) { Fail "-UploadOnly needs -SftpHost/-SftpUser/-SftpRemotePath." }
+  Send-BundleOverSftp -LocalDir $OutDir -SftpHost $SftpHost -Port $SftpPort `
+    -User $SftpUser -RemotePath $SftpRemotePath -KeyFile $SftpKey
+  exit 0
+}
 
 # ---- read upgrade path -------------------------------------------------------
 if (-not (Test-Path $Config)) { Fail "Upgrade-path file not found: $Config" }
@@ -299,8 +393,17 @@ $size = (Get-ChildItem -Path $OutDir -Recurse -File | Measure-Object -Property L
 Write-Host ""
 Ok ("Bundle ready: {0}" -f $OutDir)
 Ok ("Total size  : {0:N2} GB" -f ($size/1GB))
-Info "Next steps:"
-Info "  1. Copy the ENTIRE '$OutDir' folder to each offline Ubuntu server."
-Info "  2. On the server:  chmod +x gitlab-offline-upgrade.sh"
-Info "  3. Run:            sudo ./gitlab-offline-upgrade.sh preflight"
-Info "  4. Then:           sudo ./gitlab-offline-upgrade.sh upgrade"
+
+# ---- optional SFTP upload (same command as the download) ---------------------
+if ($DoSftp) {
+  Write-Host ""
+  Send-BundleOverSftp -LocalDir $OutDir -SftpHost $SftpHost -Port $SftpPort `
+    -User $SftpUser -RemotePath $SftpRemotePath -KeyFile $SftpKey
+} else {
+  Info "Next steps:"
+  Info "  1. Copy the ENTIRE '$OutDir' folder to each offline server"
+  Info "     (or re-run with -SftpHost/-SftpUser/-SftpRemotePath to push it over SFTP)."
+  Info "  2. On the server:  chmod +x gitlab-offline-upgrade.sh"
+  Info "  3. Run:            sudo ./gitlab-offline-upgrade.sh preflight --path <bundle-folder>"
+  Info "  4. Then:           sudo ./gitlab-offline-upgrade.sh upgrade   --path <bundle-folder>"
+}

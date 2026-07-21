@@ -14,9 +14,12 @@
 # Commands:
 #   status            Detect the install, show version and the planned path.
 #   preflight         Verify the bundle has every package/image the path needs.
-#   backup            Take a full, restorable backup (app data + secrets).
+#   backup            Take a full backup and pack it into ONE portable file
+#                     you can carry to, and restore on, another GitLab host.
+#   restore           Import a portable backup file (from `backup`) into the
+#                     GitLab installed on THIS host (backup/migrate flow).
 #   upgrade           Backup (unless --skip-backup) then step through the path.
-#   rollback          Restore a previous backup (undo an upgrade).
+#   rollback          Undo an in-place upgrade (reinstall old version + restore).
 #   verify            Post-upgrade health checks.
 #
 # Common options:
@@ -28,9 +31,12 @@
 #   --step                   Apply only the next single required stop, then stop.
 #   --yes                    Do not prompt for confirmation (unattended).
 #   --skip-backup            (upgrade) skip the automatic pre-upgrade backup.
-#   --bundle DIR             Bundle root (default: this script's directory).
+#   --bundle DIR             Bundle root - the SFTP "remote path" where the
+#     (--path DIR)           Windows-side bundle landed (default: script dir).
 #   --work-dir DIR           State/logs/backups root (default: /var/opt/gitlab-offline-upgrade).
-#   --backup DIR             (rollback) which backup directory to restore.
+#   --out FILE               (backup) path for the single portable backup file.
+#   --from FILE              (restore) the portable backup file to import.
+#   --backup DIR             (rollback/restore) a backup directory to use.
 # =============================================================================
 set -euo pipefail
 
@@ -47,6 +53,8 @@ SKIP_BACKUP=0
 BUNDLE_DIR="$SCRIPT_DIR"
 WORK_DIR="/var/opt/gitlab-offline-upgrade"
 ROLLBACK_BACKUP=""
+RESTORE_FROM=""
+BACKUP_OUT=""
 EL_OVERRIDE=""
 export FORCE_TYPE GL_EDITION GL_CONTAINER ASSUME_YES
 
@@ -65,14 +73,17 @@ while [[ $# -gt 0 ]]; do
     --step)      STEP_ONLY=1; shift;;
     --yes|-y)    ASSUME_YES=1; shift;;
     --skip-backup) SKIP_BACKUP=1; shift;;
-    --bundle)    BUNDLE_DIR="$(cd "$2" && pwd)"; shift 2;;
+    --bundle|--path) BUNDLE_DIR="$(cd "$2" && pwd)"; shift 2;;
     --work-dir)  WORK_DIR="$2"; shift 2;;
     --backup)    ROLLBACK_BACKUP="$2"; shift 2;;
+    --from)      RESTORE_FROM="$2"; shift 2;;
+    --out)       BACKUP_OUT="$2"; shift 2;;
     -h|--help)   usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
   esac
 done
-export FORCE_TYPE GL_EDITION GL_CONTAINER ASSUME_YES BUNDLE_DIR SCRIPT_DIR WORK_DIR ROLLBACK_BACKUP
+export FORCE_TYPE GL_EDITION GL_CONTAINER ASSUME_YES BUNDLE_DIR SCRIPT_DIR WORK_DIR \
+       ROLLBACK_BACKUP RESTORE_FROM BACKUP_OUT
 
 # ---- work dir + logging ------------------------------------------------------
 mkdir -p "$WORK_DIR/logs" "$WORK_DIR/backups"
@@ -168,7 +179,11 @@ cmd_preflight() {
 
 cmd_backup() {
   detect_gitlab
-  do_backup "$WORK_DIR/backups"
+  do_backup "$WORK_DIR/backups" portable
+}
+
+cmd_restore() {
+  do_restore "$WORK_DIR/backups"
 }
 
 cmd_upgrade() {
@@ -185,7 +200,8 @@ cmd_upgrade() {
     warn "--skip-backup given: NO pre-upgrade backup will be taken. Rollback will be impossible."
     confirm "Really upgrade without a backup?" || die "Aborted."
   else
-    do_backup "$WORK_DIR/backups"
+    # 'light' pre-upgrade backup: enough for an in-place rollback on this host.
+    do_backup "$WORK_DIR/backups" light
   fi
 
   confirm "Begin upgrading $GL_VERSION -> $target now?" || die "Aborted before first stop."
@@ -231,8 +247,9 @@ case "$COMMAND" in
   status|detect) cmd_status ;;
   preflight)     cmd_preflight ;;
   backup)        cmd_backup ;;
+  restore)       cmd_restore ;;
   upgrade)       cmd_upgrade ;;
-  rollback|restore) cmd_rollback ;;
+  rollback)      cmd_rollback ;;
   verify)        cmd_verify ;;
   help|-h|--help) usage ;;
   *) echo "Unknown command: $COMMAND" >&2; usage; exit 1 ;;
